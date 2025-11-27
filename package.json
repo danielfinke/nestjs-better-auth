@@ -14,7 +14,7 @@
 	"type": "module",
 	"scripts": {
 		"build": "unbuild",
-		"prepack": "bun run unbuild",
+		"prepack": "npm run build",
 		"lint": "biome lint",
 		"format": "biome format",
 		"check": "biome check",
