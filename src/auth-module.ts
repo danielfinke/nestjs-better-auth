@@ -137,8 +137,8 @@ export class AuthModule
 				}
 				return handler(req, res);
 			})
-			.forRoutes(`${basePath}/*`);
-		this.logger.log(`AuthModule initialized BetterAuth on '${basePath}/*'`);
+			.forRoutes(basePath);
+		this.logger.log(`AuthModule initialized BetterAuth on '${basePath}'`);
 	}
 
 	private setupHooks(
