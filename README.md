@@ -23,12 +23,12 @@ bun add @thallesp/nestjs-better-auth
 ## Prerequisites
 
 > [!IMPORTANT]  
-> Requires `better-auth` >= 1.3.8. Older versions are deprecated and unsupported.
+> Requires `better-auth` >= 1.5.0. Older versions are deprecated and unsupported.
 
 Before you start, make sure you have:
 
 - A working NestJS application
-- Better Auth (>= 1.3.8) installed and configured ([installation guide](https://www.better-auth.com/docs/installation))
+- Better Auth (>= 1.5.0) installed and configured ([installation guide](https://www.better-auth.com/docs/installation))
 
 ## Basic Setup
 
@@ -42,7 +42,7 @@ import { AppModule } from "./app.module";
 
 async function bootstrap() {
   const app = await NestFactory.create(AppModule, {
-    // Don't worry, the library will automatically re-add the default body parsers.
+    // The library will re-add the default body parsers for non-auth routes.
     bodyParser: false,
   });
   await app.listen(process.env.PORT ?? 3333);
@@ -52,11 +52,8 @@ bootstrap();
 
 > [!IMPORTANT]
 > **Side Effect:** Since we disable NestJS's built-in body parser, the `rawBody: true` option in `NestFactory.create()` has no effect.
-> If you need access to `req.rawBody` (e.g., for webhook signature verification), use the `enableRawBodyParser` option in `AuthModule.forRoot()` instead.
+> If you need access to `req.rawBody` (e.g., for webhook signature verification), use `bodyParser.rawBody` in `AuthModule.forRoot()` instead.
 > See [Module Options](#module-options) for details.
-
-> [!WARNING]  
-> Currently the library has beta support for Fastify, if you experience any issues with it, please open an issue.
 
 **2. Import AuthModule**
 
@@ -68,10 +65,25 @@ import { AuthModule } from "@thallesp/nestjs-better-auth";
 import { auth } from "./auth";
 
 @Module({
-  imports: [AuthModule.forRoot({ auth })],
+  imports: [
+    AuthModule.forRoot({
+      auth,
+      bodyParser: {
+        json: { limit: "2mb" },
+        urlencoded: { limit: "2mb", extended: true },
+        rawBody: true,
+      },
+    }),
+  ],
 })
 export class AppModule {}
 ```
+
+Both `bodyParser.json` and `bodyParser.urlencoded` accept parser options plus an `enabled` flag if you want to disable either parser individually. Set `bodyParser.rawBody` to `true` if you also want Nest-style `req.rawBody` support.
+
+On Fastify, `bodyParser.urlencoded` with `extended: true` uses the optional peer dependency `qs`. Install `qs` in your application if you want nested URL-encoded parsing there.
+
+If you configure `trustedOrigins`, this module also applies Better Auth CORS headers for auth routes. On Fastify, Better Auth routes are mounted through middleware, so app-level `@fastify/cors` does not fully cover them by itself.
 
 ## Route Protection
 
@@ -228,6 +240,167 @@ export class OrgController {
 
 > [!NOTE]
 > Both role decorators accept any role strings you define. Better Auth's organization plugin provides default roles (`owner`, `admin`, `member`), but you can configure custom roles. The organization creator automatically gets the `owner` role.
+
+### Permission-Based Access Control
+
+This library provides two permission decorators for fine-grained access control:
+
+| Decorator | Checks | Use Case |
+|-----------|--------|----------|
+| `@UserHasPermission()` | User-level permissions | System-level permissions ([admin plugin access control](https://www.better-auth.com/docs/plugins/admin/access-control)) |
+| `@MemberHasPermission()` | Organization member permissions | Organization-level permissions ([organization plugin access control](https://www.better-auth.com/docs/plugins/organization/access-control)) |
+
+#### @UserHasPermission() - System-Level Permissions
+
+Use `@UserHasPermission()` for system-wide permission-based access control. This checks user permissions using Better Auth's [admin plugin access control](https://www.better-auth.com/docs/plugins/admin/access-control).
+
+**Prerequisites:**
+- Configure access control in your Better Auth admin plugin
+
+```ts title="auth.ts"
+import { betterAuth } from "better-auth";
+import { admin } from "better-auth/plugins/admin";
+import { createAccessControl } from "better-auth/plugins/access";
+
+const statement = {
+  project: ["create", "share", "update", "delete"],
+  sale: ["create", "read", "update", "delete"],
+} as const;
+
+const ac = createAccessControl(statement);
+
+const editor = ac.newRole({
+  project: ["create", "update"],
+});
+
+const admin = ac.newRole({
+  project: ["create", "update", "delete"],
+  sale: ["create", "read", "update", "delete"],
+});
+
+export const auth = betterAuth({
+  plugins: [
+    admin({
+      ac,
+      roles: {
+        editor,
+        admin,
+      },
+    }),
+  ],
+});
+```
+
+**Usage:**
+
+```ts title="project.controller.ts"
+import { Controller, Get, Post } from "@nestjs/common";
+import { UserHasPermission } from "@thallesp/nestjs-better-auth";
+
+@Controller("projects")
+export class ProjectController {
+  @UserHasPermission({ permission: { project: ["create", "update"] } })
+  @Post()
+  async createProject() {
+    // Only users with project: ["create", "update"] permissions can access
+    return { message: "Project created" };
+  }
+
+  @UserHasPermission({ permission: { project: ["delete"] } })
+  @Post(":id/delete")
+  async deleteProject() {
+    // Only users with project: ["delete"] permission can access
+    return { message: "Project deleted" };
+  }
+
+  @UserHasPermission({
+    permissions: { project: ["create"], sale: ["create"] },
+  })
+}
+```
+
+**Options:**
+
+- `permission`: A single permission check (e.g., `{ project: ["create", "update"] }`)
+- `permissions`: Multiple permission checks across resources (e.g., `{ project: ["create"], sale: ["create"] }`)
+- `role` (server-only): Check permissions for a specific role
+- `userId` (optional): Check permissions for a specific user (defaults to current user)
+
+#### @MemberHasPermission() - Organization-Level Permissions
+
+Use `@MemberHasPermission()` for organization-scoped permission-based access control. This checks organization member permissions using Better Auth's [organization plugin access control](https://www.better-auth.com/docs/plugins/organization/access-control). Requires an active organization (`activeOrganizationId` in session).
+
+**Prerequisites:**
+- Configure access control in your Better Auth organization plugin
+- Define custom organization roles with permissions
+
+```ts title="auth.ts"
+import { betterAuth } from "better-auth";
+import { organization } from "better-auth/plugins/organization";
+import { createAccessControl } from "better-auth/plugins/access";
+
+const statement = {
+  project: ["create", "share", "update", "delete"],
+  sale: ["create", "read", "update", "delete"],
+  organization: ["update", "delete"],
+} as const;
+
+const ac = createAccessControl(statement);
+
+const editor = ac.newRole({
+  project: ["create", "update"],
+});
+
+const admin = ac.newRole({
+  project: ["create", "update", "delete"],
+  organization: ["update"],
+});
+
+export const auth = betterAuth({
+  plugins: [
+    organization({
+      ac,
+      roles: {
+        editor,
+        admin,
+      },
+    }),
+  ],
+});
+```
+
+**Usage:**
+
+```ts title="org-project.controller.ts"
+import { Controller, Get, Post } from "@nestjs/common";
+import { MemberHasPermission, Session, UserSession } from "@thallesp/nestjs-better-auth";
+
+@Controller("org/projects")
+export class OrgProjectController {
+  @MemberHasPermission({ permissions: { project: ["create", "update"] } })
+  @Post()
+  async createProject(@Session() session: UserSession) {
+    // Only org members with project: ["create", "update"] permissions can access
+    // Requires activeOrganizationId in session
+    return {
+      message: "Project created",
+      orgId: session.session.activeOrganizationId,
+    };
+  }
+
+  @MemberHasPermission({ permissions: { project: ["delete"] } })
+  @Post(":id/delete")
+  async deleteProject() {
+    // Only org members with project: ["delete"] permission can access
+    return { message: "Project deleted" };
+  }
+}
+```
+
+**Options:**
+
+- `permissions`: The permissions to check (required). Must match the structure in your organization access control.
+
 
 ### Hook Decorators
 
@@ -393,6 +566,11 @@ When configuring `AuthModule.forRoot()`, you can provide options to customize th
 AuthModule.forRoot({
   auth,
   disableTrustedOriginsCors: false,
+  bodyParser: {
+    json: { enabled: true },
+    urlencoded: { enabled: true, extended: true },
+    rawBody: false,
+  },
   disableBodyParser: false,
   enableRawBodyParser: false,
   disableGlobalAuthGuard: false,
@@ -404,12 +582,52 @@ The available options are:
 
 | Option                      | Default | Description                                                                                                                                                              |
 | --------------------------- | ------- | ------------------------------------------------------------------------------------------------------------------------------------------------------------------------ |
-| `disableTrustedOriginsCors` | `false` | When set to `true`, disables the automatic CORS configuration for the origins specified in `trustedOrigins`. Use this if you want to handle CORS configuration manually. |
-| `disableBodyParser`         | `false` | When set to `true`, disables the automatic body parser middleware. Use this if you want to handle request body parsing manually.                                         |
-| `enableRawBodyParser`       | `false` | When set to `true`, enables raw body parsing and attaches the raw buffer to `req.rawBody`. Use this for webhook signature verification. **Note:** Since this library disables NestJS's built-in body parser, NestJS's `rawBody: true` option has no effect - use this option instead. |
+| `disableTrustedOriginsCors` | `false` | When set to `true`, disables the automatic CORS configuration for the origins specified in `trustedOrigins`. On Fastify, use this only if you want to fully manage Better Auth route CORS yourself. |
+| `bodyParser`                | Re-adds JSON and URL-encoded body parsers | Configure the body parsers re-added by the module after Nest body parsing is disabled. `json` and `urlencoded` accept the parser options object plus `enabled?: boolean`, and `rawBody?: boolean` enables `req.rawBody`. |
+| `disableBodyParser`         | `false` | Deprecated. Use `bodyParser.json.enabled` and `bodyParser.urlencoded.enabled` instead. When set to `true`, disables both parsers unless you explicitly re-enable one in `bodyParser`. |
+| `enableRawBodyParser`       | `false` | Deprecated. Use `bodyParser.rawBody` instead. When set to `true`, enables raw body parsing and attaches the raw buffer to `req.rawBody`. |
 | `disableGlobalAuthGuard`    | `false` | When set to `true`, does not register `AuthGuard` as a global guard. Use this if you prefer to apply `AuthGuard` manually or register it yourself via `APP_GUARD`.       |
 | `disableControllers`        | `false` | When set to `true`, does not register any controllers. Use this if you want to handle routes manually.                                                                   |
 | `middleware`                | `undefined` | Optional middleware function that wraps the Better Auth handler. Receives `(req, res, next)` parameters. Useful for integrating with request-scoped libraries like MikroORM's RequestContext. |
+
+### Body Parser Configuration
+
+Use `bodyParser` to customize the parsers that this library re-adds after you disable Nest's built-in body parser:
+
+```ts
+AuthModule.forRoot({
+  auth,
+  bodyParser: {
+    json: {
+      limit: "2mb",
+    },
+    urlencoded: {
+      enabled: true,
+      extended: true,
+      limit: "2mb",
+    },
+    rawBody: true,
+  },
+});
+```
+
+`bodyParser.rawBody` enables `req.rawBody` support, while `bodyParser.json` and `bodyParser.urlencoded` configure the corresponding parser behavior for the active adapter.
+
+If you use Fastify with `bodyParser.urlencoded({ extended: true })`, install the optional peer dependency `qs` to enable nested form parsing.
+
+### CORS on Fastify
+
+If your Better Auth config sets `trustedOrigins`, this module applies CORS to Better Auth routes automatically.
+
+On Fastify, Better Auth routes are served through middleware internally. Because of that:
+
+- app-level `@fastify/cors` does not fully apply to Better Auth routes on its own
+- this module applies Better Auth route CORS from `trustedOrigins`
+- if `@fastify/cors` is already registered, this module skips duplicate Fastify CORS registration and logs a warning once
+
+This Fastify fallback only supports array-based `trustedOrigins`. Function-based `trustedOrigins` remain unsupported unless you set `disableTrustedOriginsCors: true` and manage Better Auth route CORS manually.
+
+Set `disableTrustedOriginsCors: true` only if you want to fully manage Better Auth route CORS yourself.
 
 ### Using Custom Middleware
 

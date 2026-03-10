@@ -13,7 +13,7 @@ import {
 	MetadataScanner,
 } from "@nestjs/core";
 import { toNodeHandler } from "better-auth/node";
-import { createAuthMiddleware } from "better-auth/plugins";
+import { createAuthMiddleware } from "better-auth/api";
 import type { Request, Response } from "express";
 import {
 	type ASYNC_OPTIONS_TYPE,
@@ -23,7 +23,15 @@ import {
 	type OPTIONS_TYPE,
 } from "./auth-module-definition.ts";
 import { AuthService } from "./auth-service.ts";
-import { SkipBodyParsingMiddleware } from "./middlewares.ts";
+import { configureFastifyBodyParser } from "./fastify-body-parser.ts";
+import {
+	SkipBodyParsingMiddleware,
+	getNodeRequest,
+	getNodeResponse,
+	handleFastifyTrustedOriginsCors,
+	matchesBasePath,
+	resolveBodyParserOptions,
+} from "./middlewares.ts";
 import { AFTER_HOOK_KEY, BEFORE_HOOK_KEY, HOOK_KEY } from "./symbols.ts";
 import { AuthGuard } from "./auth-guard.ts";
 import { APP_GUARD } from "@nestjs/core";
@@ -80,7 +88,7 @@ export class AuthModule
 		this.applicationConfig.setGlobalPrefixOptions({
 			exclude: [
 				...(globalPrefixOptions.exclude ?? []),
-				...mapToExcludeRoute([this.basePath]),
+				...mapToExcludeRoute([this.basePath, `${this.basePath}/*path`]),
 			],
 		});
 	}
@@ -115,17 +123,40 @@ export class AuthModule
 	}
 
 	configure(consumer: MiddlewareConsumer): void {
+		const adapterType = this.adapter.httpAdapter.getType();
 		const trustedOrigins = this.options.auth.options.trustedOrigins;
+		const bodyParserOptions = resolveBodyParserOptions(this.options);
 		// function-based trustedOrigins requires a Request (from web-apis) object to evaluate, which is not available in NestJS (we only have a express Request object)
 		// if we ever need this, take a look at better-call which show an implementation for this
 		const isNotFunctionBased = trustedOrigins && Array.isArray(trustedOrigins);
 
 		if (!this.options.disableTrustedOriginsCors && isNotFunctionBased) {
-			this.adapter.httpAdapter.enableCors({
-				origin: trustedOrigins,
-				methods: ["GET", "POST", "PUT", "DELETE"],
-				credentials: true,
-			});
+			if (adapterType === "fastify") {
+				const fastifyInstance = this.adapter.httpAdapter.getInstance<{
+					hasRequestDecorator?: (name: string) => boolean;
+				}>();
+				const hasFastifyCorsRegistered =
+					fastifyInstance?.hasRequestDecorator?.("corsPreflightEnabled") ??
+					false;
+
+				if (hasFastifyCorsRegistered) {
+					this.logger.warn(
+						"Detected an existing @fastify/cors registration. Skipping automatic Fastify CORS registration for Better Auth trustedOrigins to avoid duplicate plugin registration. Better Auth routes will still apply CORS from trustedOrigins. Set disableTrustedOriginsCors: true if you want to fully manage Better Auth CORS yourself.",
+					);
+				} else {
+					this.adapter.httpAdapter.enableCors({
+						origin: trustedOrigins,
+						methods: ["GET", "POST", "PUT", "DELETE"],
+						credentials: true,
+					});
+				}
+			} else {
+				this.adapter.httpAdapter.enableCors({
+					origin: trustedOrigins,
+					methods: ["GET", "POST", "PUT", "DELETE"],
+					credentials: true,
+				});
+			}
 		} else if (
 			trustedOrigins &&
 			!this.options.disableTrustedOriginsCors &&
@@ -135,26 +166,63 @@ export class AuthModule
 				"Function-based trustedOrigins not supported in NestJS. Use string array or disable CORS with disableTrustedOriginsCors: true.",
 			);
 
-		if (!this.options.disableBodyParser) {
+		if ("disableBodyParser" in this.options) {
+			this.logger.warn(
+				"`disableBodyParser` is deprecated. Use `bodyParser.json.enabled` and `bodyParser.urlencoded.enabled` instead.",
+			);
+		}
+
+		if ("enableRawBodyParser" in this.options) {
+			this.logger.warn(
+				"`enableRawBodyParser` is deprecated. Use `bodyParser.rawBody` instead.",
+			);
+		}
+
+		if (adapterType !== "fastify") {
 			consumer
 				.apply(
 					SkipBodyParsingMiddleware({
 						basePath: this.basePath,
-						enableRawBodyParser: this.options.enableRawBodyParser,
+						bodyParser: bodyParserOptions,
 					}),
 				)
 				.forRoutes("*path");
 		}
 
+		if (adapterType === "fastify") {
+			configureFastifyBodyParser(this.adapter.httpAdapter, bodyParserOptions);
+		}
+
 		const handler = toNodeHandler(this.options.auth);
-		consumer
-			.apply((req: Request, res: Response) => {
-				if (this.options.middleware) {
-					return this.options.middleware(req, res, () => handler(req, res));
+		this.adapter.httpAdapter.use(
+			(req: Request, res: Response, next: () => void) => {
+				if (!matchesBasePath(req, this.basePath)) {
+					next();
+					return;
 				}
-				return handler(req, res);
-			})
-			.forRoutes(this.basePath);
+
+				if (
+					adapterType === "fastify" &&
+					!this.options.disableTrustedOriginsCors &&
+					isNotFunctionBased &&
+					handleFastifyTrustedOriginsCors(req, res, {
+						trustedOrigins,
+					})
+				) {
+					return;
+				}
+
+				const nodeReq = getNodeRequest(req);
+				const nodeRes = getNodeResponse(res);
+
+				if (this.options.middleware) {
+					return this.options.middleware(req, res, () =>
+						handler(nodeReq, nodeRes),
+					);
+				}
+				return handler(nodeReq, nodeRes);
+			},
+		);
 		this.logger.log(`AuthModule initialized BetterAuth on '${this.basePath}'`);
 	}
 
